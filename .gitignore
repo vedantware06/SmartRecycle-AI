@@ -1,0 +1,7 @@
+.streamlit/
+smartrecycle.db
+smartrecycle_backup.db
+app copy.py
+venv/
+venv313/
+__pycache__/

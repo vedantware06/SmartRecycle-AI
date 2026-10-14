@@ -1,10 +1,9 @@
 
 import streamlit as st
 import pandas as pd
-import sqlite3
 from datetime import date
 from io import BytesIO
-from pathlib import Path
+from supabase import create_client
 
 st.set_page_config(
     page_title="SmartRecycle AI",
@@ -12,71 +11,57 @@ st.set_page_config(
     layout="wide",
 )
 
-DB_FILE = Path(__file__).resolve().parent / "smartrecycle.db"
-
 MATERIALS = [
     "Plastic", "Paper", "Metal", "Glass",
     "Copper", "Aluminium", "Iron", "PET Bottles", "Other"
 ]
 
+# Connect to Supabase using Streamlit secrets
+@st.cache_resource
+def get_supabase():
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
 
-def get_connection():
-    conn = sqlite3.connect(str(DB_FILE), timeout=15)
-    conn.execute("PRAGMA busy_timeout = 15000")
-    return conn
 
-
-def setup_database():
-    with get_connection() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                entry_date TEXT,
-                transaction_type TEXT,
-                material TEXT,
-                quantity REAL,
-                rate REAL,
-                total REAL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS market_prices (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                price_date TEXT,
-                material TEXT,
-                rate REAL,
-                source TEXT
-            )
-        """)
+def fetch_table(table, order_column):
+    response = (
+        get_supabase()
+        .table(table)
+        .select("*")
+        .order(order_column, desc=True)
+        .execute()
+    )
+    return pd.DataFrame(response.data)
 
 
 def load_transactions():
-    with get_connection() as conn:
-        return pd.read_sql_query(
-            "SELECT * FROM transactions ORDER BY entry_date DESC, id DESC",
-            conn,
+    df = fetch_table("transactions", "entry_date")
+    if not df.empty:
+        df = df.sort_values(
+            ["entry_date", "id"], ascending=[False, False]
         )
+    return df
 
 
 def load_prices():
-    with get_connection() as conn:
-        return pd.read_sql_query(
-            "SELECT * FROM market_prices ORDER BY price_date DESC, id DESC",
-            conn,
+    df = fetch_table("market_prices", "price_date")
+    if not df.empty:
+        df = df.sort_values(
+            ["price_date", "id"], ascending=[False, False]
         )
+    return df
 
 
 def excel_report(sheets):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for sheet_name, dataframe in sheets.items():
-            dataframe.to_excel(
-                writer, index=False, sheet_name=sheet_name[:31]
-            )
+        for name, df in sheets.items():
+            df.to_excel(writer, index=False, sheet_name=name[:31])
     return output.getvalue()
 
 
-def download_reports(dataframe, filename, label, sheet_name):
+def download_reports(dataframe, filename, sheet_name):
     csv_data = dataframe.to_csv(index=False).encode("utf-8-sig")
     excel_data = excel_report({sheet_name: dataframe})
 
@@ -105,7 +90,20 @@ def money(value):
     return f"₹{float(value):,.2f}"
 
 
-setup_database()
+# Connect and load data
+try:
+    supabase = get_supabase()
+    transactions = load_transactions()
+    prices = load_prices()
+except Exception as exc:
+    st.error("Supabase connection किंवा database access मध्ये समस्या आहे.")
+    st.info(
+        "secrets.toml मधील URL आणि key तपासा. "
+        "Supabase मध्ये RLS policies देखील तपासा."
+    )
+    st.caption(f"Technical details: {exc}")
+    st.stop()
+
 
 st.title("♻️ SmartRecycle AI")
 st.caption("Recycling Business Intelligence Dashboard")
@@ -127,8 +125,6 @@ with st.sidebar:
     st.divider()
     st.caption("Track • Analyse • Recycle")
 
-transactions = load_transactions()
-prices = load_prices()
 
 # ---------------- DASHBOARD ----------------
 if page == "Dashboard":
@@ -136,8 +132,6 @@ if page == "Dashboard":
     st.caption("Summary of your recorded recycling business activity.")
 
     if transactions.empty:
-        purchases = transactions.copy()
-        sales = transactions.copy()
         purchase_total = sales_total = 0.0
         purchase_kg = sales_kg = 0.0
     else:
@@ -163,8 +157,8 @@ if page == "Dashboard":
 
     st.info(
         f"Sales Revenue − Purchase Cost: {money(financial_difference)}. "
-        "हा प्राथमिक फरक आहे, अचूक नफा नाही; त्यात stock valuation, "
-        "इतर खर्च आणि विकलेल्या मालाचा प्रत्यक्ष खर्च मोजलेला नाही."
+        "हा प्राथमिक फरक आहे, अचूक नफा नाही; इतर खर्च आणि "
+        "विकलेल्या मालाचा प्रत्यक्ष खर्च यात समाविष्ट नाही."
     )
 
     left, right = st.columns(2)
@@ -189,7 +183,7 @@ if page == "Dashboard":
     with right:
         st.subheader("Stock by Material")
         if transactions.empty:
-            st.info("Stock chart उपलब्ध होण्यासाठी transactions नोंदवा.")
+            st.info("Stock chart साठी आधी transactions नोंदवा.")
         else:
             stock_qty = transactions.pivot_table(
                 index="material",
@@ -228,6 +222,7 @@ if page == "Dashboard":
         )
         st.dataframe(latest, use_container_width=True, hide_index=True)
 
+
 # ---------------- ADD TRANSACTION ----------------
 elif page == "Add Purchase / Sale":
     st.header("📝 Add Business Transaction")
@@ -250,23 +245,24 @@ elif page == "Add Purchase / Sale":
         )
 
     if submitted:
-        with get_connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO transactions
-                (entry_date, transaction_type, material, quantity, rate, total)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(entry_date), transaction_type, material,
-                    quantity, rate, round(quantity * rate, 2),
-                ),
+        try:
+            supabase.table("transactions").insert({
+                "entry_date": str(entry_date),
+                "transaction_type": transaction_type,
+                "material": material,
+                "quantity": quantity,
+                "rate": rate,
+                "total": round(quantity * rate, 2),
+            }).execute()
+            st.success(
+                f"{transaction_type} saved successfully. "
+                f"Total: {money(quantity * rate)}"
             )
-        st.success(
-            f"{transaction_type} saved successfully. "
-            f"Total: {money(quantity * rate)}"
-        )
-        st.rerun()
+            st.rerun()
+        except Exception as exc:
+            st.error("Transaction सेव्ह झाला नाही.")
+            st.caption(f"Technical details: {exc}")
+
 
 # ---------------- TRANSACTION HISTORY ----------------
 elif page == "Transaction History":
@@ -276,16 +272,21 @@ elif page == "Transaction History":
         st.info("No transactions saved yet.")
     else:
         date_col, type_col, material_col = st.columns(3)
+
         with date_col:
             start_date = st.date_input(
                 "From Date",
-                value=pd.to_datetime(transactions["entry_date"]).min().date(),
+                value=pd.to_datetime(
+                    transactions["entry_date"]
+                ).min().date(),
                 key="history_start",
             )
+
         with type_col:
             end_date = st.date_input(
                 "To Date", value=date.today(), key="history_end"
             )
+
         with material_col:
             type_filter = st.selectbox(
                 "Type Filter", ["All", "Purchase", "Sale"]
@@ -303,6 +304,7 @@ elif page == "Transaction History":
                 (filtered["entry_date"] >= start_date)
                 & (filtered["entry_date"] <= end_date)
             ]
+
             if type_filter != "All":
                 filtered = filtered[
                     filtered["transaction_type"] == type_filter
@@ -313,9 +315,9 @@ elif page == "Transaction History":
                 filtered, use_container_width=True, hide_index=True
             )
             download_reports(
-                filtered, "smartrecycle_transactions",
-                "Transactions", "Transactions"
+                filtered, "smartrecycle_transactions", "Transactions"
             )
+
 
 # ---------------- MARKET PRICES ----------------
 elif page == "Market Prices":
@@ -353,41 +355,38 @@ elif page == "Market Prices":
         elif not source.strip().startswith(("https://", "http://")):
             st.error("Valid source URL http:// किंवा https:// ने सुरू करा.")
         else:
-            with get_connection() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO market_prices
-                    (price_date, material, rate, source)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        str(price_date), market_material,
-                        market_rate, source.strip(),
-                    ),
-                )
-            st.success("Market price saved successfully!")
-            st.rerun()
+            try:
+                supabase.table("market_prices").insert({
+                    "price_date": str(price_date),
+                    "material": market_material,
+                    "rate": market_rate,
+                    "source": source.strip(),
+                }).execute()
+                st.success("Market price saved successfully!")
+                st.rerun()
+            except Exception as exc:
+                st.error("Market price सेव्ह झाला नाही.")
+                st.caption(f"Technical details: {exc}")
 
     st.subheader("📋 Saved Market Prices")
-    prices = load_prices()
     if prices.empty:
         st.info("Market prices अजून सेव्ह केलेले नाहीत.")
     else:
         st.dataframe(prices, use_container_width=True, hide_index=True)
+
         st.subheader("📈 Market Price Trend")
-        trend = (
-            prices.pivot_table(
-                index="price_date",
-                columns="material",
-                values="rate",
-                aggfunc="mean",
-            ).sort_index()
-        )
+        trend = prices.pivot_table(
+            index="price_date",
+            columns="material",
+            values="rate",
+            aggfunc="mean",
+        ).sort_index()
         st.line_chart(trend)
+
         download_reports(
-            prices, "smartrecycle_market_prices",
-            "Market Prices", "Market Prices"
+            prices, "smartrecycle_market_prices", "Market Prices"
         )
+
 
 # ---------------- STOCK MANAGEMENT ----------------
 elif page == "Stock Management":
@@ -414,7 +413,9 @@ elif page == "Stock Management":
         stock["Available Stock (kg)"] = (
             stock["Total Purchased (kg)"] - stock["Total Sold (kg)"]
         )
-        stock = stock.reset_index().rename(columns={"material": "Material"})
+        stock = stock.reset_index().rename(
+            columns={"material": "Material"}
+        )
 
         c1, c2, c3 = st.columns(3)
         c1.metric(
@@ -445,12 +446,12 @@ elif page == "Stock Management":
         )
 
         download_reports(
-            stock, "smartrecycle_stock_report",
-            "Stock Report", "Stock"
+            stock, "smartrecycle_stock_report", "Stock Report"
         )
+
 
 st.divider()
 st.caption(
     "SmartRecycle AI • Recycling Business Intelligence • "
-    "SQLite Database • CSV & Excel Reports"
+    "Supabase Database • CSV & Excel Reports"
 )
